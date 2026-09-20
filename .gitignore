@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+build/
+dist/
+*.spec
+*.zip
+*.exe
+crash_log.txt
+Graded_Images/
+批改_*/
