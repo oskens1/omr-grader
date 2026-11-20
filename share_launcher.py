@@ -8,6 +8,7 @@ def main():
     ap.add_argument('--config',type=Path)
     ap.add_argument('--output',type=Path)
     ap.add_argument('--mode',default='PRINTED_0914')
+    ap.add_argument('--expected-classes', default='')
     ap.add_argument('--gui-probe',type=Path)
     a=ap.parse_args()
     home=Path(sys.executable).parent if getattr(sys,'frozen',False) else Path(__file__).parent
@@ -21,6 +22,7 @@ def main():
     from main_qt import MainWindow, GradingThread
     from config_manager import ConfigManager
     from omr_upgrade import OMRProcessor
+    from detection_recovery import expected_classes
     app=QApplication(sys.argv);app.setStyle('Fusion')
     if a.batch:
         if not a.config or not a.output: ap.error('--batch requires --config and --output')
@@ -28,7 +30,7 @@ def main():
         mgr=ConfigManager(str(a.config));ok,msg=mgr.load_config()
         if not ok: raise ValueError(msg)
         core=OMRProcessor(str(Path(getattr(sys,'_MEIPASS',home))/'assets'))
-        worker=GradingThread(str(a.batch),str(a.output),core,mgr,a.mode)
+        worker=GradingThread(str(a.batch),str(a.output),core,mgr,a.mode,expected_classes(a.expected_classes))
         messages=[];done=[]
         worker.log_signal.connect(messages.append)
         worker.finished_signal.connect(lambda ok,msg:done.append({'ok':ok,'message':msg}))

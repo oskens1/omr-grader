@@ -1,5 +1,8 @@
-"""Frozen 2026-09-14 detection functions; no T001 data or execution entry.
-Extracted verbatim; provenance in detection_provenance.json.
+"""Detection functions ported from the 2026-09-14 pipeline.
+
+V5.3 shares timing extraction with the optional recovery mode. The existing
+locate path still requires all 25 observed bars. V5.2 provenance is kept in
+detection_provenance.json.
 """
 import cv2
 import numpy as np
@@ -15,7 +18,7 @@ def project(h, pts):
 
 
 
-def timing(gray):
+def timing_groups(gray):
     bw = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)[1]
     n, _, stats, cent = cv2.connectedComponentsWithStats(bw, 8)
     bars = [cent[i] for i in range(1, n)
@@ -31,7 +34,11 @@ def timing(gray):
     gaps = np.where(np.diff(bars[:, 1]) > 80)[0]
     if len(gaps) != 1:
         raise ValueError('ambiguous timing groups')
-    ids, ans = np.split(bars, [gaps[0] + 1])
+    return np.split(bars, [gaps[0] + 1])
+
+
+def timing(gray):
+    ids, ans = timing_groups(gray)
     if len(ans) != 25:
         raise ValueError(f'answer timing count {len(ans)} != 25')
     dy = np.diff(ans[:, 1])
@@ -95,8 +102,8 @@ def trace_line(gray, ylo, yhi, xmin):
 
 
 
-def locate(gray, old):
-    ids, bars = timing(gray)
+def locate(gray, old, *, timing_data=None):
+    ids, bars = timing(gray) if timing_data is None else timing_data
     spacing = float(np.median(np.diff(bars[:, 1])))
     # Search from the leftmost timing evidence. A median x clips the border
     # endpoint when the whole sheet rotates, even though every timing is found.

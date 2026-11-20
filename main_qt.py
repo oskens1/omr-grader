@@ -38,6 +38,7 @@ from openpyxl.styles import Font as XlFont, PatternFill
 # 匯入核心模組
 from omr_upgrade import OMRProcessor
 from config_manager import ConfigManager
+import detection_recovery as recovery
 from classsheet import build_class_grade_sheet
 
 
@@ -53,13 +54,15 @@ class GradingThread(QThread):
     progress_signal = pyqtSignal(int, int)  # 發送進度 (current, total)
     finished_signal = pyqtSignal(bool, str)  # 完成信號 (success, message)
     
-    def __init__(self, pdf_path, output_dir, omr_processor, config_manager, card_mode="OFFICIAL"):
+    def __init__(self, pdf_path, output_dir, omr_processor, config_manager, card_mode="OFFICIAL",
+                 expected_classes=()):
         super().__init__()
         self.pdf_path = pdf_path
         self.output_dir = output_dir
         self.omr = omr_processor
         self.config_mgr = config_manager
         self.card_mode = card_mode  # "OFFICIAL"=正式卡 / "PRINTED"=影印卡
+        self.expected_classes = set(expected_classes)
         self.is_running = True
     
     def run(self):
@@ -67,7 +70,8 @@ class GradingThread(QThread):
         try:
             # 依卡別設定定位模式與渲染解析度
             self.omr.set_card_mode(self.card_mode)
-            if self.card_mode in ("PRINTED", "PRINTED_0914"):
+            use_recovery = self.card_mode == recovery.MODE
+            if self.card_mode in ("PRINTED", "PRINTED_0914", recovery.MODE):
                 self.render_mat = fitz.Matrix(200 / 72.0, 200 / 72.0)  # 影印卡：200dpi（定位校準值）
                 self.log_signal.emit("卡別：影印卡（timing marks 定位，200dpi）")
             elif self.card_mode == "OFFICIAL_DYN":
@@ -134,18 +138,26 @@ class GradingThread(QThread):
                         "_review": "; ".join(audit.get("flags", [])),
                         "_answers": ans,  # 每題作答記錄（不寫進 DataFrame，用 openpyxl 處理）
                     })
-                    self.log_signal.emit(f"-> 成功: 學號 {sid}, 分數 {score}")
+                    if use_recovery:
+                        audit['image'] = save_name
+                        self.log_signal.emit("-> 已讀取，批次完成後確認待核狀態")
+                    else:
+                        self.log_signal.emit(f"-> 成功: 學號 {sid}, 分數 {score}")
                 else:
                     fail_path = os.path.join(img_out_dir, f"FAIL_Page_{page_num+1}.jpg")
                     cv2.imencode('.jpg', debug_img)[1].tofile(fail_path)
+                    if use_recovery:
+                        audit['image'] = os.path.basename(fail_path)
                     self.log_signal.emit(f"-> 失敗: {status}")
             
             # Keep failures and uncertain observations visible independently of grades.
+            if use_recovery:
+                all_grades = recovery.finalize_batch(audit_rows, all_grades, self.expected_classes)
             import json
             with open(os.path.join(self.output_dir, "讀卡檢查.json"), "w", encoding="utf-8") as f:
                 json.dump(audit_rows, f, ensure_ascii=False, indent=2)
             # 儲存成績單
-            if all_grades:
+            if all_grades or use_recovery:
                 # 學號從小到大排序
                 all_grades.sort(key=lambda g: str(g.get("學號", "")))
 
@@ -341,9 +353,18 @@ class GradingThread(QThread):
                     self.log_signal.emit(f"班級成績表產生略過: {_e_cs}")
 
                 review_sheet = wb.create_sheet("讀卡待核")
-                review_sheet.append(["頁碼", "狀態", "需人工核對（分數為初判）"])
+                review_sheet.append(
+                    ["頁碼", "狀態", "需人工核對", "讀到的學號"] if use_recovery else
+                    ["頁碼", "狀態", "需人工核對（分數為初判）"])
                 for audit in audit_rows:
-                    review_sheet.append([audit["page"], audit["status"], "; ".join(audit.get("flags", []))])
+                    cells = [audit["page"], audit["status"], "; ".join(audit.get("flags", []))]
+                    if use_recovery:
+                        cells.append(audit.get('sid', ''))
+                    review_sheet.append(cells)
+                    if use_recovery:
+                        cell = review_sheet.cell(review_sheet.max_row, 1)
+                        cell.hyperlink = "Graded_Images/" + audit['image']
+                        cell.style = "Hyperlink"
                 review_sheet.column_dimensions['A'].width = 10
                 review_sheet.column_dimensions['B'].width = 30
                 review_sheet.column_dimensions['C'].width = 100
@@ -361,7 +382,13 @@ class GradingThread(QThread):
                 except Exception as e:
                     self.log_signal.emit(f"PDF 產生失敗（不影響 Excel）: {e}")
 
-                self.finished_signal.emit(True, f"批改完成：{len(all_grades)}/{total_pages} 頁有成績；請查看「讀卡待核」與批閱圖，分數為初判。")
+                if use_recovery:
+                    review_count = sum(audit['status'] == 'REVIEW' for audit in audit_rows)
+                    rejected = total_pages - len(all_grades) - review_count
+                    self.finished_signal.emit(True, f"共 {total_pages} 頁：{len(all_grades)} 頁列入成績表，"
+                                              f"{review_count} 頁待核，{rejected} 頁拒收。請查看「讀卡待核」。")
+                else:
+                    self.finished_signal.emit(True, f"批改完成：{len(all_grades)}/{total_pages} 頁有成績；請查看「讀卡待核」與批閱圖，分數為初判。")
             else:
                 self.log_signal.emit("未產生任何有效成績。")
                 self.finished_signal.emit(False, "未產生任何有效成績")
@@ -415,7 +442,7 @@ class MainWindow(QMainWindow):
     
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("自動閱卷小助手 V5.2 試用版 班級成績表+ID判定 (PyQt6)")
+        self.setWindowTitle("自動閱卷小助手 V5.3 試用版")
         self.setMinimumSize(900, 700)
         
         # 初始化核心模組
@@ -547,6 +574,7 @@ class MainWindow(QMainWindow):
         self.card_combo.addItem("正式卡-動態定位版（timing+四角）", "OFFICIAL_DYN")
         self.card_combo.addItem("影印卡（列印版，B5 掃成 A4）", "PRINTED")
         self.card_combo.addItem("正式卡（電腦閱卷標準卡）", "OFFICIAL")
+        self.card_combo.addItem("影印卡－定位復原（試用，第 1～15 題）", recovery.MODE)
         self.card_combo.setStyleSheet(
             "QComboBox { padding: 6px; border: 1px solid #B0BEC5; border-radius: 4px;"
             " color: black; background-color: white; }"
@@ -560,6 +588,23 @@ class MainWindow(QMainWindow):
         card_layout.addWidget(card_label)
         card_layout.addWidget(self.card_combo)
         file_layout.addLayout(card_layout)
+
+        class_label = QLabel("班級檢查：")
+        class_label.setFixedWidth(100)
+        self.expected_classes_edit = QLineEdit()
+        self.expected_classes_edit.setPlaceholderText("選填，例如 202、203")
+        class_layout = QHBoxLayout()
+        class_layout.addWidget(class_label)
+        class_layout.addWidget(self.expected_classes_edit)
+        file_layout.addLayout(class_layout)
+
+        def show_class_check():
+            visible = self.card_combo.currentData() == recovery.MODE
+            class_label.setVisible(visible)
+            self.expected_classes_edit.setVisible(visible)
+
+        self.card_combo.currentIndexChanged.connect(show_class_check)
+        show_class_check()
 
         main_layout.addWidget(file_frame)
         
@@ -710,6 +755,9 @@ class MainWindow(QMainWindow):
     
     def open_param_settings(self):
         """開啟參數設定視窗"""
+        if self.card_combo.currentData() == recovery.MODE:
+            QMessageBox.information(self, "定位復原參數", "定位復原使用固定校驗條件，限第 1～15 題。")
+            return
         if self.card_combo.currentData() == "PRINTED_0914":
             QMessageBox.information(self, "改良版參數", "9/14 改良模式使用固定已驗證參數，限 Q1～Q10。\n原參數面板只適用舊模式；新模式請依讀卡待核表覆核。")
             return
@@ -743,6 +791,14 @@ class MainWindow(QMainWindow):
             if reply == QMessageBox.StandardButton.No:
                 return
         
+        card_mode = self.card_combo.currentData()
+        try:
+            classes = (recovery.expected_classes(self.expected_classes_edit.text())
+                       if card_mode == recovery.MODE else ())
+        except ValueError as exc:
+            QMessageBox.warning(self, "班級格式", str(exc))
+            return
+
         # 停用按鈕
         self.start_btn.setEnabled(False)
         self.start_btn.setText("批改中...")
@@ -750,11 +806,10 @@ class MainWindow(QMainWindow):
         # 取得卡別選擇
         output_dir = os.path.join(output_dir, datetime.now().strftime("批改_%Y%m%d_%H%M%S_%f"))
         os.makedirs(output_dir, exist_ok=False)
-        card_mode = self.card_combo.currentData()
 
         # 建立並啟動執行緒
         self.grading_thread = GradingThread(
-            pdf_path, output_dir, self.omr, self.config_mgr, card_mode
+            pdf_path, output_dir, self.omr, self.config_mgr, card_mode, classes
         )
         self.grading_thread.log_signal.connect(self.log)
         self.grading_thread.finished_signal.connect(self.on_grading_finished)
